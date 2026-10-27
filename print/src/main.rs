@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 use clap::{Parser, Subcommand};
 use defmt_decoder::{
     log::{
@@ -32,8 +32,9 @@ struct Opts {
     /// The firmware running on the device being logged.
     ///
     /// May be repeated for devices that log several images over one stream (e.g. bootloader and
-    /// application). The images' defmt indices must not overlap, and the first ELF supplies the
-    /// RTT address for `tcp --set-addr`.
+    /// application). The images must use the same defmt encoding, their defmt indices must not
+    /// overlap, and they must place the RTT control block (`_SEGGER_RTT`) at the same address.
+    /// The first ELF supplies the RTT address for `tcp --set-addr`.
     #[arg(short, required = true, conflicts_with("version"))]
     elf: Vec<PathBuf>,
 
@@ -138,17 +139,9 @@ impl Source {
             return Ok(());
         }
 
-        let elf = Elf::parse(elf_bytes)?;
-        let rtt_symbol = elf
-            .syms
-            .iter()
-            .find(|sym| elf.strtab.get_at(sym.st_name) == Some("_SEGGER_RTT"))
-            .ok_or_else(|| anyhow!("Symbol '_SEGGER_RTT' not found in ELF file"))?;
+        let addr = segger_rtt_addr(elf_bytes)?;
 
-        let cmd = format!(
-            "$$SEGGER_TELNET_ConfigStr=SetRTTAddr;{:#x}$$",
-            rtt_symbol.st_value
-        );
+        let cmd = format!("$$SEGGER_TELNET_ConfigStr=SetRTTAddr;{addr:#x}$$");
         tcpstream.write_all(cmd.as_bytes()).await?;
 
         Ok(())
@@ -263,11 +256,22 @@ async fn run(opts: Opts, source: &mut Source) -> anyhow::Result<()> {
         ..
     } = opts;
 
+    // reject duplicate ELFs (e.g. `fw.elf` and `./fw.elf`); identical files would fail the
+    // compatibility check with a confusing index-overlap message
+    let mut seen = BTreeSet::new();
+    for path in &elf {
+        if let Ok(canonical) = path.canonicalize() {
+            if !seen.insert(canonical) {
+                bail!("ELF {} was given more than once", path.display());
+            }
+        }
+    }
+
     let mut elfs = Vec::with_capacity(elf.len());
     for path in elf {
         elfs.push(LoadedElf::load(path).await?);
     }
-    check_tables_compatible(&elfs)?;
+    check_elfs_compatible(&elfs)?;
 
     // Give the _SEGGER_RTT address to the source.
     source.set_rtt_addr(&elfs[0].bytes).await?;
@@ -313,6 +317,7 @@ async fn run(opts: Opts, source: &mut Source) -> anyhow::Result<()> {
         .iter()
         .map(|elf| elf.table.new_stream_decoder())
         .collect();
+    // We have already enforced that all elfs have the same format
     let can_recover = elfs[0].table.encoding().can_recover();
     let current_dir = env::current_dir()?;
 
@@ -396,9 +401,10 @@ impl LoadedElf {
     }
 }
 
-/// Several ELFs can share a stream only if every frame belongs to exactly one table, which needs
-/// matching encodings and disjoint indices.
-fn check_tables_compatible(elfs: &[LoadedElf]) -> anyhow::Result<()> {
+/// Several ELFs can share a stream only if every frame belongs to exactly one table and all
+/// images expose one RTT control block, which needs matching encodings, disjoint defmt indices
+/// and identical `_SEGGER_RTT` addresses.
+fn check_elfs_compatible(elfs: &[LoadedElf]) -> anyhow::Result<()> {
     let Some((first, rest)) = elfs.split_first() else {
         bail!("no ELF given");
     };
@@ -406,9 +412,6 @@ fn check_tables_compatible(elfs: &[LoadedElf]) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if !first.table.encoding().can_recover() {
-        bail!("multiple ELFs need a recoverable encoding such as rzcobs");
-    }
     if let Some(other) = rest
         .iter()
         .find(|elf| elf.table.encoding() != first.table.encoding())
@@ -418,6 +421,9 @@ fn check_tables_compatible(elfs: &[LoadedElf]) -> anyhow::Result<()> {
             first.table.encoding(),
             other.table.encoding()
         );
+    }
+    if !first.table.encoding().can_recover() {
+        bail!("multiple ELFs need a recoverable encoding such as rzcobs");
     }
 
     for (i, a) in elfs.iter().enumerate() {
@@ -434,7 +440,30 @@ fn check_tables_compatible(elfs: &[LoadedElf]) -> anyhow::Result<()> {
         }
     }
 
+    let first_rtt = segger_rtt_addr(&first.bytes).context("ELF #1")?;
+    for (i, elf) in rest.iter().enumerate() {
+        let rtt = segger_rtt_addr(&elf.bytes).with_context(|| format!("ELF #{}", i + 2))?;
+        if rtt != first_rtt {
+            bail!(
+                "ELFs #1 and #{} have different `_SEGGER_RTT` addresses ({first_rtt:#x} and \
+                {rtt:#x}); all images must place the RTT control block at the same address",
+                i + 2
+            );
+        }
+    }
+
     Ok(())
+}
+
+/// Returns the address of the `_SEGGER_RTT` control-block symbol defined in `elf_bytes`.
+fn segger_rtt_addr(elf_bytes: &[u8]) -> anyhow::Result<u64> {
+    let elf = Elf::parse(elf_bytes)?;
+    let rtt_symbol = elf
+        .syms
+        .iter()
+        .find(|sym| elf.strtab.get_at(sym.st_name) == Some("_SEGGER_RTT"))
+        .ok_or_else(|| anyhow!("Symbol '_SEGGER_RTT' not found in ELF file"))?;
+    Ok(rtt_symbol.st_value)
 }
 
 type LocationInfo = (Option<String>, Option<u32>, Option<String>);
