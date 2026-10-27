@@ -12,7 +12,7 @@ use defmt_decoder::{
         format::{Formatter, FormatterConfig, HostFormatter},
         DefmtLoggerType,
     },
-    DecodeError, Frame, Locations, Table, DEFMT_VERSIONS,
+    DecodeError, Frame, Locations, StreamDecoder, Table, DEFMT_VERSIONS,
 };
 use goblin::elf::Elf;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -337,27 +337,12 @@ async fn run(opts: Opts, source: &mut Source) -> anyhow::Result<()> {
         // Every decoder sees the same bytes and so the same frame boundaries. Step them together:
         // the decoder whose table owns the frame's index decodes it and the others reject it.
         loop {
-            let mut decoded = None;
-            let mut needs_more_data = 0;
-            let mut rejected = 0;
-            for (stream_decoder, elf) in stream_decoders.iter_mut().zip(&elfs) {
-                match stream_decoder.decode() {
-                    Ok(frame) => {
-                        if decoded.replace((frame, &elf.locs)).is_some() {
-                            bail!("more than one ELF decoded the same frame");
-                        }
-                    }
-                    Err(DecodeError::UnexpectedEof) => needs_more_data += 1,
-                    Err(DecodeError::Malformed) => rejected += 1,
-                }
-            }
-
-            match decoded {
-                Some((frame, locs)) if needs_more_data == 0 => {
+            match step_decoders(&mut stream_decoders, &elfs)? {
+                Step::NeedMoreData => break,
+                Step::Decoded(frame, locs) => {
                     forward_to_logger(&frame, location_info(locs, &frame, &current_dir))
                 }
-                None if needs_more_data == elfs.len() => break,
-                None if needs_more_data == 0 && rejected == elfs.len() => {
+                Step::Malformed => {
                     // if recovery is impossible, abort
                     if !can_recover {
                         return Err(DecodeError::Malformed.into());
@@ -370,9 +355,47 @@ async fn run(opts: Opts, source: &mut Source) -> anyhow::Result<()> {
                         println!("└─ {} @ {}:{}", env!("CARGO_PKG_NAME"), file!(), line!());
                     }
                 }
-                _ => bail!("ELF decoders are out of step on the frame boundaries"),
             }
         }
+    }
+}
+
+/// One frame-boundary step across all decoders.
+enum Step<'a> {
+    /// No decoder has a complete frame yet; the stream needs more bytes.
+    NeedMoreData,
+    /// One decoder's table owns the frame; the others rejected it.
+    Decoded(Frame<'a>, &'a Option<Locations>),
+    /// Every decoder rejected the frame.
+    Malformed,
+}
+
+/// Every decoder sees the same bytes and so the same frame boundaries. Step them together: the
+/// decoder whose table owns a frame's index decodes it, the others reject it.
+fn step_decoders<'a, 't>(
+    stream_decoders: &'a mut [Box<dyn StreamDecoder + Send + Sync + 't>],
+    elfs: &'a [LoadedElf],
+) -> anyhow::Result<Step<'a>> {
+    let mut decoded = None;
+    let (mut incomplete, mut rejected) = (0, 0);
+
+    for (stream_decoder, elf) in stream_decoders.iter_mut().zip(elfs) {
+        match stream_decoder.decode() {
+            Ok(frame) => {
+                if decoded.replace((frame, &elf.locs)).is_some() {
+                    bail!("more than one ELF decoded the same frame");
+                }
+            }
+            Err(DecodeError::UnexpectedEof) => incomplete += 1,
+            Err(DecodeError::Malformed) => rejected += 1,
+        }
+    }
+
+    match (decoded, incomplete, rejected) {
+        (Some((frame, locs)), 0, _) => Ok(Step::Decoded(frame, locs)),
+        (None, incomplete, 0) if incomplete == elfs.len() => Ok(Step::NeedMoreData),
+        (None, 0, rejected) if rejected == elfs.len() => Ok(Step::Malformed),
+        _ => bail!("ELF decoders are out of step on the frame boundaries"),
     }
 }
 
