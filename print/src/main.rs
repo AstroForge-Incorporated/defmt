@@ -32,9 +32,9 @@ struct Opts {
     /// The firmware running on the device being logged.
     ///
     /// May be repeated for devices that log several images over one stream (e.g. bootloader and
-    /// application). The images must use the same defmt encoding, their defmt indices must not
-    /// overlap, and they must place the RTT control block (`_SEGGER_RTT`) at the same address.
-    /// The first ELF supplies the RTT address for `tcp --set-addr`.
+    /// application). The images must use the same defmt encoding and their defmt indices must not
+    /// overlap. With `tcp --set-addr`, they must also place the RTT control block (`_SEGGER_RTT`)
+    /// at the same address.
     #[arg(short, required = true, conflicts_with("version"))]
     elf: Vec<PathBuf>,
 
@@ -127,6 +127,11 @@ impl Source {
             ser.write_data_terminal_ready(true)?;
         }
         Ok(Source::Serial(ser))
+    }
+
+    /// Whether this source tells the probe where the RTT control block is.
+    fn sets_rtt_addr(&self) -> bool {
+        matches!(self, Source::Tcp(_, true))
     }
 
     async fn set_rtt_addr(&mut self, elf_bytes: &[u8]) -> anyhow::Result<()> {
@@ -271,7 +276,7 @@ async fn run(opts: Opts, source: &mut Source) -> anyhow::Result<()> {
     for path in elf {
         elfs.push(LoadedElf::load(path).await?);
     }
-    check_elfs_compatible(&elfs)?;
+    check_elfs_compatible(&elfs, source.sets_rtt_addr())?;
 
     // Give the _SEGGER_RTT address to the source.
     source.set_rtt_addr(&elfs[0].bytes).await?;
@@ -424,10 +429,10 @@ impl LoadedElf {
     }
 }
 
-/// Several ELFs can share a stream only if every frame belongs to exactly one table and all
-/// images expose one RTT control block, which needs matching encodings, disjoint defmt indices
-/// and identical `_SEGGER_RTT` addresses.
-fn check_elfs_compatible(elfs: &[LoadedElf]) -> anyhow::Result<()> {
+/// Several ELFs can share a stream only if every frame belongs to exactly one table, which needs
+/// matching encodings and disjoint defmt indices. With `same_rtt_addr`, they must also place
+/// `_SEGGER_RTT` at one address, since the probe is given only the first ELF's.
+fn check_elfs_compatible(elfs: &[LoadedElf], same_rtt_addr: bool) -> anyhow::Result<()> {
     let Some((first, rest)) = elfs.split_first() else {
         bail!("no ELF given");
     };
@@ -463,6 +468,9 @@ fn check_elfs_compatible(elfs: &[LoadedElf]) -> anyhow::Result<()> {
         }
     }
 
+    if !same_rtt_addr {
+        return Ok(());
+    }
     let first_rtt = segger_rtt_addr(&first.bytes).context("ELF #1")?;
     for (i, elf) in rest.iter().enumerate() {
         let rtt = segger_rtt_addr(&elf.bytes).with_context(|| format!("ELF #{}", i + 2))?;
