@@ -1,17 +1,18 @@
 use std::{
+    collections::BTreeSet,
     env,
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use anyhow::anyhow;
+use anyhow::{anyhow, bail, Context};
 use clap::{Parser, Subcommand};
 use defmt_decoder::{
     log::{
         format::{Formatter, FormatterConfig, HostFormatter},
         DefmtLoggerType,
     },
-    DecodeError, Frame, Locations, Table, DEFMT_VERSIONS,
+    DecodeError, Frame, Locations, StreamDecoder, Table, DEFMT_VERSIONS,
 };
 use goblin::elf::Elf;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -28,9 +29,14 @@ use tokio_serial::{SerialPort, SerialPortBuilderExt, SerialStream};
 #[derive(Parser, Clone)]
 #[command(name = "defmt-print")]
 struct Opts {
-    /// The firmware running on the device being logged
+    /// The firmware running on the device being logged.
+    ///
+    /// May be repeated for devices that log several images over one stream (e.g. bootloader and
+    /// application). The images must use the same defmt encoding, their defmt indices must not
+    /// overlap, and they must place the RTT control block (`_SEGGER_RTT`) at the same address.
+    /// The first ELF supplies the RTT address for `tcp --set-addr`.
     #[arg(short, required = true, conflicts_with("version"))]
-    elf: Option<PathBuf>,
+    elf: Vec<PathBuf>,
 
     /// Emit logs in JSON format
     #[arg(long)]
@@ -133,17 +139,9 @@ impl Source {
             return Ok(());
         }
 
-        let elf = Elf::parse(elf_bytes)?;
-        let rtt_symbol = elf
-            .syms
-            .iter()
-            .find(|sym| elf.strtab.get_at(sym.st_name) == Some("_SEGGER_RTT"))
-            .ok_or_else(|| anyhow!("Symbol '_SEGGER_RTT' not found in ELF file"))?;
+        let addr = segger_rtt_addr(elf_bytes)?;
 
-        let cmd = format!(
-            "$$SEGGER_TELNET_ConfigStr=SetRTTAddr;{:#x}$$",
-            rtt_symbol.st_value
-        );
+        let cmd = format!("$$SEGGER_TELNET_ConfigStr=SetRTTAddr;{addr:#x}$$");
         tcpstream.write_all(cmd.as_bytes()).await?;
 
         Ok(())
@@ -195,10 +193,13 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn has_file_changed(rx: &mut Receiver<Result<Event, notify::Error>>, path: &PathBuf) -> bool {
+async fn has_file_changed(
+    rx: &mut Receiver<Result<Event, notify::Error>>,
+    paths: &[PathBuf],
+) -> bool {
     loop {
         if let Some(Ok(event)) = rx.recv().await {
-            if event.paths.contains(path) {
+            if event.paths.iter().any(|changed| paths.contains(changed)) {
                 if let notify::EventKind::Create(_) | notify::EventKind::Modify(_) = event.kind {
                     break;
                 }
@@ -211,11 +212,11 @@ async fn has_file_changed(rx: &mut Receiver<Result<Event, notify::Error>>, path:
 async fn run_and_watch(opts: Opts, source: &mut Source) -> anyhow::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
-    let path = opts.elf.clone().unwrap().canonicalize().unwrap();
-
-    // We want the elf directory instead of the elf, since some editors remove
-    // and recreate the file on save which will remove the notifier
-    let directory_path = path.parent().unwrap();
+    let paths = opts
+        .elf
+        .iter()
+        .map(|elf| elf.canonicalize())
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut watcher = RecommendedWatcher::new(
         move |res| {
@@ -223,12 +224,23 @@ async fn run_and_watch(opts: Opts, source: &mut Source) -> anyhow::Result<()> {
         },
         Config::default(),
     )?;
-    watcher.watch(directory_path.as_ref(), RecursiveMode::NonRecursive)?;
+    // We want the elf directory instead of the elf, since some editors remove
+    // and recreate the file on save which will remove the notifier
+    let directory_paths: BTreeSet<&Path> = paths
+        .iter()
+        .map(|path| {
+            path.parent()
+                .ok_or_else(|| anyhow!("{} has no parent directory", path.display()))
+        })
+        .collect::<Result<_, _>>()?;
+    for directory_path in directory_paths {
+        watcher.watch(directory_path, RecursiveMode::NonRecursive)?;
+    }
 
     loop {
         select! {
             r = run(opts.clone(), source) => return r,
-            _ = has_file_changed(&mut rx, &path) => ()
+            _ = has_file_changed(&mut rx, &paths) => ()
         }
     }
 }
@@ -244,21 +256,25 @@ async fn run(opts: Opts, source: &mut Source) -> anyhow::Result<()> {
         ..
     } = opts;
 
-    // read and parse elf file
-    let bytes = fs::read(elf.unwrap()).await?;
-    let table = Table::parse(&bytes)?.ok_or_else(|| anyhow!(".defmt data not found"))?;
-    let locs = table.get_locations(&bytes)?;
+    // reject duplicate ELFs (e.g. `fw.elf` and `./fw.elf`); identical files would fail the
+    // compatibility check with a confusing index-overlap message
+    let mut seen = BTreeSet::new();
+    for path in &elf {
+        if let Ok(canonical) = path.canonicalize() {
+            if !seen.insert(canonical) {
+                bail!("ELF {} was given more than once", path.display());
+            }
+        }
+    }
+
+    let mut elfs = Vec::with_capacity(elf.len());
+    for path in elf {
+        elfs.push(LoadedElf::load(path).await?);
+    }
+    check_elfs_compatible(&elfs)?;
 
     // Give the _SEGGER_RTT address to the source.
-    source.set_rtt_addr(&bytes).await?;
-
-    // check if the locations info contains all the indicies
-    let locs = if table.indices().all(|idx| locs.contains_key(&(idx as u64))) {
-        Some(locs)
-    } else {
-        log::warn!("(BUG) location info is incomplete; it will be omitted from the output");
-        None
-    };
+    source.set_rtt_addr(&elfs[0].bytes).await?;
 
     let logger_type = if json {
         DefmtLoggerType::Json
@@ -275,7 +291,7 @@ async fn run(opts: Opts, source: &mut Source) -> anyhow::Result<()> {
         FormatterConfig::default()
     };
 
-    formatter_config.is_timestamp_available = table.has_timestamp();
+    formatter_config.is_timestamp_available = elfs.iter().any(|elf| elf.table.has_timestamp());
 
     let cloned_host_format = host_log_format.clone().unwrap_or_default();
     let host_formatter_config = if host_log_format.is_some() {
@@ -297,11 +313,16 @@ async fn run(opts: Opts, source: &mut Source) -> anyhow::Result<()> {
     });
 
     let mut buf = [0; READ_BUFFER_SIZE];
-    let mut stream_decoder = table.new_stream_decoder();
+    let mut stream_decoders: Vec<_> = elfs
+        .iter()
+        .map(|elf| elf.table.new_stream_decoder())
+        .collect();
+    // We have already enforced that all elfs have the same format
+    let can_recover = elfs[0].table.encoding().can_recover();
     let current_dir = env::current_dir()?;
 
     loop {
-        // read from stdin or tcpstream and push it to the decoder
+        // read from stdin or tcpstream and push it to the decoders
         let (n, eof) = source.read(&mut buf).await?;
 
         // if 0 bytes where read, we reached EOF, so quit
@@ -309,30 +330,163 @@ async fn run(opts: Opts, source: &mut Source) -> anyhow::Result<()> {
             break Ok(());
         }
 
-        stream_decoder.received(&buf[..n]);
+        for stream_decoder in &mut stream_decoders {
+            stream_decoder.received(&buf[..n]);
+        }
 
-        // decode the received data
+        // Every decoder sees the same bytes and so the same frame boundaries. Step them together:
+        // the decoder whose table owns the frame's index decodes it and the others reject it.
         loop {
-            match stream_decoder.decode() {
-                Ok(frame) => forward_to_logger(&frame, location_info(&locs, &frame, &current_dir)),
-                Err(DecodeError::UnexpectedEof) => break,
-                Err(DecodeError::Malformed) => match table.encoding().can_recover() {
+            match step_decoders(&mut stream_decoders, &elfs)? {
+                Step::NeedMoreData => break,
+                Step::Decoded(frame, locs) => {
+                    forward_to_logger(&frame, location_info(locs, &frame, &current_dir))
+                }
+                Step::Malformed => {
                     // if recovery is impossible, abort
-                    false => return Err(DecodeError::Malformed.into()),
-                    // if recovery is possible, skip the current frame and continue with new data
-                    true => {
-                        // bug: https://github.com/rust-lang/rust-clippy/issues/9810
-                        #[allow(clippy::print_literal)]
-                        if show_skipped_frames || verbose {
-                            println!("(HOST) malformed frame skipped");
-                            println!("└─ {} @ {}:{}", env!("CARGO_PKG_NAME"), file!(), line!());
-                        }
-                        continue;
+                    if !can_recover {
+                        return Err(DecodeError::Malformed.into());
                     }
-                },
+                    // if recovery is possible, skip the current frame and continue with new data
+                    // bug: https://github.com/rust-lang/rust-clippy/issues/9810
+                    #[allow(clippy::print_literal)]
+                    if show_skipped_frames || verbose {
+                        println!("(HOST) malformed frame skipped");
+                        println!("└─ {} @ {}:{}", env!("CARGO_PKG_NAME"), file!(), line!());
+                    }
+                }
             }
         }
     }
+}
+
+/// One frame-boundary step across all decoders.
+enum Step<'a> {
+    /// No decoder has a complete frame yet; the stream needs more bytes.
+    NeedMoreData,
+    /// One decoder's table owns the frame; the others rejected it.
+    Decoded(Frame<'a>, &'a Option<Locations>),
+    /// Every decoder rejected the frame.
+    Malformed,
+}
+
+/// Every decoder sees the same bytes and so the same frame boundaries. Step them together: the
+/// decoder whose table owns a frame's index decodes it, the others reject it.
+fn step_decoders<'a, 't>(
+    stream_decoders: &'a mut [Box<dyn StreamDecoder + Send + Sync + 't>],
+    elfs: &'a [LoadedElf],
+) -> anyhow::Result<Step<'a>> {
+    let mut decoded = None;
+    let (mut incomplete, mut rejected) = (0, 0);
+
+    for (stream_decoder, elf) in stream_decoders.iter_mut().zip(elfs) {
+        match stream_decoder.decode() {
+            Ok(frame) => {
+                if decoded.replace((frame, &elf.locs)).is_some() {
+                    bail!("more than one ELF decoded the same frame");
+                }
+            }
+            Err(DecodeError::UnexpectedEof) => incomplete += 1,
+            Err(DecodeError::Malformed) => rejected += 1,
+        }
+    }
+
+    match (decoded, incomplete, rejected) {
+        (Some((frame, locs)), 0, _) => Ok(Step::Decoded(frame, locs)),
+        (None, incomplete, 0) if incomplete == elfs.len() => Ok(Step::NeedMoreData),
+        (None, 0, rejected) if rejected == elfs.len() => Ok(Step::Malformed),
+        _ => bail!("ELF decoders are out of step on the frame boundaries"),
+    }
+}
+
+struct LoadedElf {
+    bytes: Vec<u8>,
+    table: Table,
+    locs: Option<Locations>,
+}
+
+impl LoadedElf {
+    async fn load(path: PathBuf) -> anyhow::Result<Self> {
+        let bytes = fs::read(&path).await?;
+        let table = Table::parse(&bytes)?
+            .ok_or_else(|| anyhow!(".defmt data not found in {}", path.display()))?;
+        let locs = table.get_locations(&bytes)?;
+
+        // check if the locations info contains all the indicies
+        let locs = if table.indices().all(|idx| locs.contains_key(&(idx as u64))) {
+            Some(locs)
+        } else {
+            log::warn!("(BUG) location info is incomplete; it will be omitted from the output");
+            None
+        };
+
+        Ok(Self { bytes, table, locs })
+    }
+}
+
+/// Several ELFs can share a stream only if every frame belongs to exactly one table and all
+/// images expose one RTT control block, which needs matching encodings, disjoint defmt indices
+/// and identical `_SEGGER_RTT` addresses.
+fn check_elfs_compatible(elfs: &[LoadedElf]) -> anyhow::Result<()> {
+    let Some((first, rest)) = elfs.split_first() else {
+        bail!("no ELF given");
+    };
+    if rest.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(other) = rest
+        .iter()
+        .find(|elf| elf.table.encoding() != first.table.encoding())
+    {
+        bail!(
+            "ELFs use different defmt encodings ({:?} and {:?})",
+            first.table.encoding(),
+            other.table.encoding()
+        );
+    }
+    if !first.table.encoding().can_recover() {
+        bail!("multiple ELFs need a recoverable encoding such as rzcobs");
+    }
+
+    for (i, a) in elfs.iter().enumerate() {
+        let a_indices: BTreeSet<usize> = a.table.indices().collect();
+        for (j, b) in elfs.iter().enumerate().skip(i + 1) {
+            if let Some(idx) = b.table.indices().find(|idx| a_indices.contains(idx)) {
+                bail!(
+                    "ELFs #{} and #{} both define defmt index {idx:#x}; link one image's \
+                    `.defmt` section at a different base so the index ranges are disjoint",
+                    i + 1,
+                    j + 1
+                );
+            }
+        }
+    }
+
+    let first_rtt = segger_rtt_addr(&first.bytes).context("ELF #1")?;
+    for (i, elf) in rest.iter().enumerate() {
+        let rtt = segger_rtt_addr(&elf.bytes).with_context(|| format!("ELF #{}", i + 2))?;
+        if rtt != first_rtt {
+            bail!(
+                "ELFs #1 and #{} have different `_SEGGER_RTT` addresses ({first_rtt:#x} and \
+                {rtt:#x}); all images must place the RTT control block at the same address",
+                i + 2
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns the address of the `_SEGGER_RTT` control-block symbol defined in `elf_bytes`.
+fn segger_rtt_addr(elf_bytes: &[u8]) -> anyhow::Result<u64> {
+    let elf = Elf::parse(elf_bytes)?;
+    let rtt_symbol = elf
+        .syms
+        .iter()
+        .find(|sym| elf.strtab.get_at(sym.st_name) == Some("_SEGGER_RTT"))
+        .ok_or_else(|| anyhow!("Symbol '_SEGGER_RTT' not found in ELF file"))?;
+    Ok(rtt_symbol.st_value)
 }
 
 type LocationInfo = (Option<String>, Option<u32>, Option<String>);
