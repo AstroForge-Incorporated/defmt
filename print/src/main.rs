@@ -129,12 +129,9 @@ impl Source {
         Ok(Source::Serial(ser))
     }
 
-    /// Whether this source tells the probe where the RTT control block is.
-    fn sets_rtt_addr(&self) -> bool {
-        matches!(self, Source::Tcp(_, true))
-    }
-
-    async fn set_rtt_addr(&mut self, elf_bytes: &[u8]) -> anyhow::Result<()> {
+    /// The probe is given a single RTT control block address, so every image must place
+    /// `_SEGGER_RTT` there.
+    async fn set_rtt_addr(&mut self, elfs: &[LoadedElf]) -> anyhow::Result<()> {
         let Source::Tcp(tcpstream, set_addr) = self else {
             return Ok(());
         };
@@ -144,7 +141,21 @@ impl Source {
             return Ok(());
         }
 
-        let addr = segger_rtt_addr(elf_bytes)?;
+        let Some((first, rest)) = elfs.split_first() else {
+            bail!("no ELF given");
+        };
+        let addr = segger_rtt_addr(&first.bytes).context("ELF #1")?;
+        for (i, elf) in rest.iter().enumerate() {
+            let other = segger_rtt_addr(&elf.bytes).with_context(|| format!("ELF #{}", i + 2))?;
+            if other != addr {
+                bail!(
+                    "ELFs #1 and #{} have different `_SEGGER_RTT` addresses ({addr:#x} and \
+                    {other:#x}); `--set-addr` needs all images to place the RTT control block at \
+                    the same address",
+                    i + 2
+                );
+            }
+        }
 
         let cmd = format!("$$SEGGER_TELNET_ConfigStr=SetRTTAddr;{addr:#x}$$");
         tcpstream.write_all(cmd.as_bytes()).await?;
@@ -276,10 +287,10 @@ async fn run(opts: Opts, source: &mut Source) -> anyhow::Result<()> {
     for path in elf {
         elfs.push(LoadedElf::load(path).await?);
     }
-    check_elfs_compatible(&elfs, source.sets_rtt_addr())?;
+    check_elfs_compatible(&elfs)?;
 
     // Give the _SEGGER_RTT address to the source.
-    source.set_rtt_addr(&elfs[0].bytes).await?;
+    source.set_rtt_addr(&elfs).await?;
 
     let logger_type = if json {
         DefmtLoggerType::Json
@@ -430,9 +441,8 @@ impl LoadedElf {
 }
 
 /// Several ELFs can share a stream only if every frame belongs to exactly one table, which needs
-/// matching encodings and disjoint defmt indices. With `same_rtt_addr`, they must also place
-/// `_SEGGER_RTT` at one address, since the probe is given only the first ELF's.
-fn check_elfs_compatible(elfs: &[LoadedElf], same_rtt_addr: bool) -> anyhow::Result<()> {
+/// matching encodings and disjoint defmt indices.
+fn check_elfs_compatible(elfs: &[LoadedElf]) -> anyhow::Result<()> {
     let Some((first, rest)) = elfs.split_first() else {
         bail!("no ELF given");
     };
@@ -465,21 +475,6 @@ fn check_elfs_compatible(elfs: &[LoadedElf], same_rtt_addr: bool) -> anyhow::Res
                     j + 1
                 );
             }
-        }
-    }
-
-    if !same_rtt_addr {
-        return Ok(());
-    }
-    let first_rtt = segger_rtt_addr(&first.bytes).context("ELF #1")?;
-    for (i, elf) in rest.iter().enumerate() {
-        let rtt = segger_rtt_addr(&elf.bytes).with_context(|| format!("ELF #{}", i + 2))?;
-        if rtt != first_rtt {
-            bail!(
-                "ELFs #1 and #{} have different `_SEGGER_RTT` addresses ({first_rtt:#x} and \
-                {rtt:#x}); all images must place the RTT control block at the same address",
-                i + 2
-            );
         }
     }
 
